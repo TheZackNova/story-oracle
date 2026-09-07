@@ -1586,6 +1586,21 @@ const ENABLE_AUTO_DIAGNOSE = true;
 // runAutoDiagnose 实读（constants-meta 守）。
 const AUTO_DIAGNOSE_WRITE_BACK = true;
 
+// 🩺 自动诊断【楼层播种】开关（1.77.2）。Discord 用户 YKWIM 报：MVU「更新方式=额外模型解析」且【不勾】「启用自动请求」时，
+// 自动诊断跑了却没有状态栏。机理（对 MagVarUpdate beta @ 61010da 与酒馆助手 4.9.3 真源码核过）：那种配置下 MVU 对新
+// AI 楼【什么都不做】（on_message_received.ts 早退，handleVariablesInMessage 不跑）→ 这一楼没有变量、没有占位符；酒馆
+// 助手按楼读变量、不回溯 → 神谕读到 {} → 补丁每条都被 MVU 跳过 → 结局 ineffective → 写回分支（只认 applied）不补占位符。
+// 修法 = 替 MVU 做它本该做的那一步（diagSeedTargetFloor）：目标楼没数据、更早的楼有 → 复制最近一楼的整份 MvuData、用
+// parseMessage 把这条回复自己的指令跑一遍（= MVU 的 handleVariablesInMessage）、写到目标楼、补占位符；此后甲/乙/丙 闸与
+// 写回逻辑逐字不变。护栏：播种前给 MVU 一个宽限窗（DIAG_SEED_GRACE_MS；它的 MESSAGE_RECEIVED 有 3s throttle），期间它
+// 自己种好 / 转忙就不种；parseMessage 抛错 → 不种（退回旧行为）。false = 播种步整段不跑，与 1.77.1 逐字节相同。
+// runAutoDiagnose 实读（constants-meta 守）。单测 diag-floor-seed.test.mjs。
+const ENABLE_DIAG_FLOOR_SEED = true;
+// 宽限窗默认值（毫秒）：MVU 的 MESSAGE_RECEIVED 入口 `_.throttle(onMessageReceived, 3000)` —— 连着两次 MESSAGE_RECEIVED
+// （快速重掷 / 群聊）时它的处理会被推迟到 3s 末尾；给 3.5s 让它先做完自己那份，再判「这一楼真的没人管」。
+// 运行期可由 autoDiagnoseSeedGraceMs 覆盖（无 UI，单测用它缩短等待）。
+const DIAG_SEED_GRACE_MS = 3500;
+
 // 🩺 诊断【把修正写进正文】总开关（实验性）—— ⚠ 自动诊断【与手动诊断卡的「应用」】共用这一枚开关
 // （Task 6 起：手动「应用」也走同一味药、同一个运行期 opt-in diagInjectBody、同一套折算 / 自检 / 幂等 /
 // 陈旧守卫）。关掉它 = 两条路都不再碰消息正文。默认行为（核验·甲）只把修正写进 MVU 实时状态、不碰消息
@@ -1837,7 +1852,7 @@ const ENABLE_CUSTOM_PERSONAS = true;
 // —— 更新提醒（1.38.0）——
 // SO_VERSION 是代码内唯一版本号，必须与 manifest.json 的 version 完全一致——update-check.test.mjs
 // 有失配即红的漂移钉（发版清单：两处一起 bump）。
-const SO_VERSION = '1.77.0';
+const SO_VERSION = '1.77.3';
 // 更新提醒总开关。false → 设置面板不渲染「更新」组、开窗不检查、红点绘制器与一键更新 no-op、
 // 绑定/回填跳过——字节级零行为变化。运行期另有 opt-out 设置 updAutoCheck（默认开）。
 const ENABLE_UPDATE_CHECK = true;
@@ -2092,6 +2107,7 @@ const defaults = {
     autoDiagnoseEnabled: false,
     autoDiagnoseWarned: false,
     autoDiagnoseDelayMs: 1200,
+    autoDiagnoseSeedGraceMs: DIAG_SEED_GRACE_MS,   // 🩺 楼层播种前给 MVU 的宽限窗（1.77.2；无 UI）
     // 🩺 自动诊断 × MVU「额外模型解析」兼容（opt-in，默认关）。开时才在 MESSAGE_RECEIVED 建 4s
     // 启动观察窗；见 busy 后锁存整批直到最终 idle UPDATE_ENDED（跨 retry false 间隙），最多 10 分钟。
     // 关闭时 awaitMvuCompatBatch 立即返回，不给普通 / 行内 MVU 用户增加任何延时。
@@ -12835,7 +12851,9 @@ async function applyFix(patchBlock, statusEl, expectStatKey, replyText) {
         // ⚠ 状态取 snapshot（解析【前】的深拷贝）而不是 oldData —— 与上面 diagOpOutcomes 的基线同一份：
         // MVU 的 parseMessage 允许【就地】改 oldData（diag-applyfix 有专门的钉），拿它当基线，预检就会
         // 对着一份已经被动过的状态去判「这条路径存不存在」。取数仍走 diagStatOf（退化 MvuData 的唯一口径）。
-        const zero = diagZeroChangeReport(patch.text, diagStatOf(snapshot), report, patch);
+        // schema 第 5 参（1.77.3）：MvuData 自带的那份，用来判「这一层可不可扩展」+ 认出 mvu_zod 卡
+        // （它把 schema 设成字符串）。拿不到就是缺席 → 判定与 1.77.2 逐字节相同。
+        const zero = diagZeroChangeReport(patch.text, diagStatOf(snapshot), report, patch, (snapshot || {}).schema);
         statusEl.textContent = (zero.code === 'empty')
             ? '模型认为无需改动（补丁为空）—— 未写入。'
             : diagZeroHeadline(zero.code) + ' —— 未写入。' + repairDiagNote(patch) + zero.text;
@@ -13308,6 +13326,23 @@ async function runAutoDiagnose(ctx, s, targetId, chatKey, compatSession, retrySt
     await awaitMvuIdle(Mvu, { isCancelled: postReplyShouldStop });
     if (postReplyShouldStop()) return;
 
+    // 🩺 楼层播种（1.77.2，ENABLE_DIAG_FLOOR_SEED）：目标楼没有 MVU 数据（MVU「额外模型解析 + 不自动请求」对它什么都不做）
+    // → 先替 MVU 把上一有效楼的状态种到这一楼、跑一遍它自己的指令、补占位符，下面读到的才是真状态，甲/乙/丙 闸与写回
+    // 逐字照旧。只在【目标楼仍是最末非系统楼】（用户又发了消息则 MVU 的 MESSAGE_SENT 已把状态抄到用户楼）且【聊天仍是
+    // 起跑时那个】时动手；播种内部任何拿不准都原样退出。位置在两道早退与 awaitMvuIdle 之后：没配好连接的人不该被晾。
+    if (ENABLE_DIAG_FLOOR_SEED && targetId != null) {
+        const pre = resolveAutoTargetMessage(ctx.chat, targetId);
+        const anchor = (chatKey != null ? chatKey : fixChatKey());
+        if (pre.idx >= 0 && pre.idx === mvuLatestMsgId() && fixChatKey() === anchor) {
+            await diagSeedTargetFloor(Mvu, ctx, pre.idx, {
+                graceMs: s.autoDiagnoseSeedGraceMs,
+                isCancelled: postReplyShouldStop,
+                anchorOk: () => fixChatKey() === anchor,
+            });
+            if (postReplyShouldStop()) return;
+        }
+    }
+
     // 自建诊断上下文（不碰窗口共享的 worldInfoBlock / diagStatData / diagLatestUpdate）。
     let wiBlock;
     if (diagPickerActive()) {
@@ -13521,7 +13556,7 @@ async function autoApplyFix(Mvu, patchBlock, expectStatKey, expectChatKey, reply
         // 判不出（_.set 方言 / 我们解析不动 = 'nodata'）或补丁本来就是空数组（'empty'）才退回旧的
         // 'nochange' —— 那两档的行为与 1.67.0 之前【逐字一致】（diag-applyfix 的 _.set 方言腿钉着）。
         if (!report) {
-            const bare = diagZeroChangeReport(patch.text, diagStatOf(snapshot), null, patch);
+            const bare = diagZeroChangeReport(patch.text, diagStatOf(snapshot), null, patch, (snapshot || {}).schema);
             return (bare.code === 'nodata' || bare.code === 'empty')
                 ? { status: 'nochange', repair: patch }
                 : { status: 'ineffective', zero: bare, repair: patch };
@@ -13530,7 +13565,8 @@ async function autoApplyFix(Mvu, patchBlock, expectStatKey, expectChatKey, reply
         // 那个纯函数拿不到）。zero.code === 'empty' 才是真·「模型说无需改动」——毒元素被剔光那档
         // （total 0 但 dropped > 0）绝不能混进 verified。
         // 基线同 diagOpOutcomes：snapshot（解析前深拷贝），理由见 applyFix 同处注释。
-        const zero = diagZeroChangeReport(patch.text, diagStatOf(snapshot), report, patch);
+        // schema 第 5 参同 applyFix（1.77.3）。
+        const zero = diagZeroChangeReport(patch.text, diagStatOf(snapshot), report, patch, (snapshot || {}).schema);
         return (report.total === 0 && zero.code === 'empty')
             ? { status: 'verified', report, repair: patch }
             : { status: 'ineffective', report, zero, repair: patch };
@@ -13600,7 +13636,16 @@ function refreshLatestMvuBar() {
 function applyBlockToCurrentSwipe(m, block, placeholder) {
     if (!m || typeof m.mes !== 'string') return m ? m.mes : '';
     if (block && !m.mes.includes(block)) {                   // 幂等：已写过就不重复追加
-        m.mes = m.mes.trimEnd() + '\n\n' + block;
+        const tail = m.mes.trimEnd();
+        if (placeholder && tail.endsWith(placeholder)) {
+            // 消息已以占位符收尾（1.77.2 楼层播种先补了它）→ 块插到占位符【前面】，保持 MVU 自己的顺序：
+            // 先块、后占位符（额外模型解析路 = 先追加解析结果、handleVariablesInMessage 再补占位符；1734 卡实测的
+            // 就是这个顺序）。没有尾随占位符时行为逐字不变。
+            const head = tail.slice(0, tail.length - placeholder.length).trimEnd();
+            m.mes = (head ? head + '\n\n' : '') + block + '\n\n' + placeholder;
+        } else {
+            m.mes = tail + '\n\n' + block;
+        }
     }
     // 再补上 MVU 状态栏占位符（衍生情形 MVU 没跑、不会自己加它）——否则有更新块也不出状态栏（见 STATUS_PLACEHOLDER）。
     if (placeholder && !m.mes.includes(placeholder)) {
@@ -13639,6 +13684,107 @@ async function writeUpdateBlockToMessage(idx, block, expectText) {
     // 返回「这次是否真把 block 追加进去了」——撤销据此决定该不该把它摘掉（幂等守卫可能压根没追加）。
     // 旧调用点忽略返回值，行为不变。
     return !before.includes(block) && m.mes.includes(block);
+}
+
+/* ── 🩺 楼层播种（1.77.2，ENABLE_DIAG_FLOOR_SEED）────────────────────────────────────────
+ * MVU 的状态是【按楼】存的：每一楼在酒馆助手的 `variables[swipe_id]` 槽里放自己那份 MvuData，「当前状态」= 最末楼那份。
+ * 正常配置下 MVU 在 MESSAGE_RECEIVED 时自己把上一份复制到新楼（handleVariablesInMessage：回溯到最近一楼有效数据、
+ * klona、对整条正文跑 updateVariables、写到本楼、补 <StatusPlaceHolderImpl/>）。「额外模型解析 + 不自动请求」这一档它
+ * 什么都不做，于是最末楼是空槽、酒馆助手读回 {}、神谕全套逻辑都在一份空状态上空转。下面三件套就是把 MVU 那一步照做一遍。
+ * 只在【目标楼空 + 更早有有效楼】时动手；任何一步拿不准（无 API / 无种源 / 解析抛错 / 期间 MVU 自己写了 / 切了聊天）
+ * 都原样退出 = 与 1.77.1 逐字相同。单测 diag-floor-seed.test.mjs。
+ */
+
+// 纯函数：这一楼的 MVU 槽是不是【空】的。酒馆助手对没有槽的楼回 `{}`（variables.ts `?? {}`）——只认这种「一无所有」；
+// 有 stat_data 的楼当然不空，退化形状（变量摊在顶层、没有 stat_data —— diagStatOf 的 FIX 5 那类卡）也【不空】，
+// 绝不能拿「没有 stat_data 键」当判据去覆盖它们。null / undefined 视同空。
+function mvuFloorDataEmpty(data) {
+    if (data == null || typeof data !== 'object') return true;
+    try { return Object.keys(data).length === 0; } catch (e) { return true; }
+}
+
+// 纯函数：从 targetIdx 往前找【种源】—— 镜像 MVU 的 getLastValidMessageId：[0, target) 逐楼倒序、不跳系统楼、
+// 只认【同时有 stat_data 与 schema】的楼（MVU 的 isMvuData 口径；缺 schema 的楼 MVU 自己下次回溯也会跳过，
+// 我们若拿它当种源，种出来的楼 MVU 同样不认）。readAt(i) 由调用方给（运行期 = Mvu.getMvuData 数字楼号）；
+// 读某楼抛错（酒馆助手数字楼号越界会抛）→ 当作无效楼继续。回 { idx, data } 或 null。
+function mvuFindSeedSource(targetIdx, readAt) {
+    const end = Number(targetIdx);
+    if (!Number.isInteger(end) || end <= 0 || typeof readAt !== 'function') return null;
+    for (let i = end - 1; i >= 0; i--) {
+        let d;
+        try { d = readAt(i); } catch (e) { continue; }
+        if (d && typeof d === 'object' && d.stat_data !== undefined && d.schema !== undefined) return { idx: i, data: d };
+    }
+    return null;
+}
+
+// 替 MVU 做它本该做的那一步。回 { seeded, reason, srcIdx? }；绝不抛。
+// opts：graceMs（宽限窗，缺省 DIAG_SEED_GRACE_MS）· isCancelled（中断谓词）· anchorOk（聊天身份仍是起跑时那个）。
+// 顺序（承重）：空判 → 找种源 → 宽限窗（MVU 自己种好 / 转忙就让它）→ 深拷贝种源 → parseMessage(整条正文) → 写前三道
+// 复核（未中断 / 未切聊天 / 目标楼未被改 / MVU 没在等待期间写过）→ replaceMvuData → 补占位符 + saveChat → 重渲染。
+async function diagSeedTargetFloor(Mvu, ctx, idx, opts = {}) {
+    const out = { seeded: false, reason: '' };
+    try {
+        if (!Mvu || typeof Mvu.getMvuData !== 'function' || typeof Mvu.replaceMvuData !== 'function' || typeof Mvu.parseMessage !== 'function') {
+            out.reason = 'no-api'; return out;
+        }
+        const chat = (ctx && ctx.chat) || [];
+        const m = chat[idx];
+        if (!m || m.is_user || m.is_system || typeof m.mes !== 'string') { out.reason = 'bad-target'; return out; }
+        const readAt = (i) => Mvu.getMvuData({ type: 'message', message_id: i });
+        const isCancelled = (typeof opts.isCancelled === 'function') ? opts.isCancelled : () => false;
+        const anchorOk = (typeof opts.anchorOk === 'function') ? opts.anchorOk : () => true;
+        if (!mvuFloorDataEmpty(readAt(idx))) { out.reason = 'has-data'; return out; }
+        const src = mvuFindSeedSource(idx, readAt);
+        if (!src) { out.reason = 'no-source'; return out; }
+        // 宽限窗：MVU 的处理可能只是迟到（3s throttle）。它在窗内把楼种好 → 让它；转忙（额外模型解析起跑）→ 等它闲，
+        // 闲下来楼有数据 → 让它；窗内两样都没发生 → 这一楼真的没人管，我们种。
+        const graceMs = (opts.graceMs == null) ? DIAG_SEED_GRACE_MS : Math.max(0, Number(opts.graceMs) || 0);
+        const pollMs = Math.max(20, Math.min(250, Math.floor(graceMs / 5) || 20));
+        const t0 = Date.now();
+        while (Date.now() - t0 < graceMs) {
+            if (isCancelled()) { out.reason = 'cancelled'; return out; }
+            if (mvuIsBusy(Mvu)) {
+                await awaitMvuIdle(Mvu, { isCancelled });
+                if (isCancelled()) { out.reason = 'cancelled'; return out; }
+                if (!mvuFloorDataEmpty(readAt(idx))) { out.reason = 'mvu-seeded'; return out; }
+                break;                                       // 它跑完了仍留空楼 → 轮到我们
+            }
+            if (!mvuFloorDataEmpty(readAt(idx))) { out.reason = 'mvu-seeded'; return out; }
+            await new Promise((r) => setTimeout(r, pollMs));
+        }
+        if (!mvuFloorDataEmpty(readAt(idx))) { out.reason = 'mvu-seeded'; return out; }
+        if (isCancelled() || !anchorOk()) { out.reason = 'cancelled'; return out; }
+        const textAtStart = m.mes;
+        let data = JSON.parse(JSON.stringify(src.data));
+        try {
+            // = MVU 的 handleVariablesInMessage 对这一楼会做的事：从种源副本出发，对【整条正文】跑一遍更新引擎——
+            // 正文里若自带更新块 / 裸 _.set，此刻就是它【唯一】一次被执行（这一楼没数据 = MVU 确实没跑过）；没有指令
+            // 则原样得到副本（MVU 会顺手重算 display_data / delta_data、剥 $internal，与官方形状一致）。
+            const parsed = await Mvu.parseMessage(textAtStart, data);
+            if (parsed && typeof parsed === 'object') data = parsed;
+        } catch (e) {
+            console.warn('[Story Oracle] 自动诊断楼层播种：parseMessage 失败，本楼不播种（按旧行为继续）：', e);
+            out.reason = 'parse-error'; return out;
+        }
+        if (isCancelled() || !anchorOk()) { out.reason = 'cancelled'; return out; }
+        if (chat[idx] !== m || m.mes !== textAtStart) { out.reason = 'target-moved'; return out; }
+        if (!mvuFloorDataEmpty(readAt(idx))) { out.reason = 'mvu-seeded'; return out; }   // 等待期间 MVU 自己写了 → 让它
+        await Mvu.replaceMvuData(data, { type: 'message', message_id: idx });
+        const before = m.mes;
+        applyBlockToCurrentSwipe(m, null, STATUS_PLACEHOLDER);   // 只补占位符（幂等；镜像到当前 swipe 槽）
+        if (m.mes !== before) {
+            try { if (ctx && typeof ctx.saveChat === 'function') await ctx.saveChat(); }
+            catch (e) { console.warn('[Story Oracle] 自动诊断楼层播种：补占位符后保存失败：', e); }
+        }
+        refreshMessageBar(idx);
+        out.seeded = true; out.srcIdx = src.idx; out.reason = 'seeded';
+        console.debug(`[Story Oracle] 自动诊断：第 ${idx} 楼没有 MVU 数据，已按第 ${src.idx} 楼播种（MVU 未处理这一楼）。`);
+        return out;
+    } catch (e) {
+        console.warn('[Story Oracle] 自动诊断楼层播种失败（已跳过，按旧行为继续）：', e);
+        out.reason = 'error'; return out;
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -16015,11 +16161,56 @@ function diagTypeMismatch(cur, val) {
     return true;
 }
 
+/* ── 🩺 1.77.3：schema 感知的两条判定 ────────────────────────────────────────────
+ * 我们手里【本来就有】那份 schema —— applyFix / autoApplyFix 的 snapshot 就是整份 MvuData，
+ * 里面的 .schema 从 1.67.0 起一直没人看过。而 MVU 的 generateSchema 默认把每一个对象【和】数组都
+ * 标成 extensible:false（除非卡片写了 $meta.extensible / recursiveExtensible / $__META_EXTENSIBLE__$），
+ * 于是「往没标可扩展的容器里新增一个键」是一条【可预测】的失败 —— 1.77.2 之前它被判 'creates' →
+ * 落进 residual → 文案甩锅给「酒馆助手版本偏旧 / mvu_zod」（2026-09-06 Discord 报障那一张）。
+ * 【红线】schema 缺席、或不是普通对象（mvu_zod 每轮把它设成字符串 '没有用别管这个'）时，这两条判定
+ * 一律不启用 —— 判定权那时不在 MVU 原生执行器手里，行为必须与 1.77.2 逐字节相同。
+ */
+
+// 纯函数：按 MVU 的 getSchemaForPath（schema.ts:209）逐段走 schema 树。纯数字段 → 数组节点的
+// elementType；其余 → 对象节点的 properties[段]；走不到回 null（null 在 MVU 那边 = 【不做】schema
+// 检查，只剩父路径存在性那道闸）。空段数组 = 根节点。可单测。
+function diagSchemaNodeAt(schema, segs) {
+    if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return null;
+    let node = schema;
+    for (const seg of (segs || [])) {
+        if (!node || typeof node !== 'object') return null;
+        const s = String(seg);
+        if (/^\d+$/.test(s)) {
+            if (node.type === 'array' && node.elementType) node = node.elementType;
+            else return null;
+        } else if (node.type === 'object' && node.properties && node.properties[s]) {
+            node = node.properties[s];
+        } else return null;
+    }
+    return (node && typeof node === 'object') ? node : null;
+}
+
+// 纯函数：MVU 的 add 执行器（update_variables.ts:1324，= JSONPatch 的 delta）认不认这个【现值】。
+// 认：数字 / VWD 对的第一格是数字 / Date 对象 / 「new Date 解析得动且不是纯数字串」的字符串（按毫秒加减）。
+// 都不是 → addUnsupportedValue 报错跳过，一个字都写不进去。可单测。
+function diagDeltaTargetOk(cur) {
+    const v = mvuIsVwdPair(cur) ? cur[0] : cur;
+    if (typeof v === 'number') return true;
+    if (Object.prototype.toString.call(v) === '[object Date]') return true;
+    if (typeof v === 'string') {
+        const d = new Date(v);
+        return !isNaN(d.getTime()) && isNaN(Number(v));   // 纯数字串【有意】不算日期（源码原话）
+    }
+    return false;
+}
+
 // 纯函数：单条 op 的受理判定。verdict 取值（按判定顺序）：
 //   poison / unknown-verb / bad-path / missing-path / bad-container / bad-delta / vwd-shape
-//   / noop-equal / schema-blocked / type-mismatch / creates / ok
+//   / noop-equal / schema-blocked / not-extensible / delta-target-not-number / type-mismatch
+//   / creates / ok
 // 拿不到状态 = 没有证据 → 一律停在 'ok'，绝不冤枉补丁。
-function diagPreflightOp(op, stat) {
+// schema（可选，1.77.3）= 这张卡的 MvuData.schema。缺席 / 不是普通对象 → 与 1.77.2 逐字节相同。
+function diagPreflightOp(op, stat, schema) {
     const path = (typeof op.path === 'string') ? op.path : (typeof op.to === 'string' ? op.to : '');
     const r = { index: 0, op: op.op, path, verdict: 'ok' };
     if (['replace', 'delta', 'insert', 'add', 'remove', 'move'].indexOf(op.op) < 0) { r.verdict = 'unknown-verb'; return r; }
@@ -16038,12 +16229,22 @@ function diagPreflightOp(op, stat) {
     // 修复层通常会先把它拆成 insert+remove（diagDecomposeMove），拆不动才轮到这条判定说话。
     if (op.op === 'move') { r.verdict = 'move-unsupported'; return r; }
     if (!hasStat) return r;                                          // 没有状态 = 没有证据
+    // 1.77.3：schema 看得懂才启用下面两条判定（mvu_zod 把它设成字符串 → 恒不启用，见上方红线）
+    const schemaOn = !!(schema && typeof schema === 'object' && !Array.isArray(schema));
     if (op.op === 'insert' || op.op === 'add') {
         // ⑦ 判定落点是【父容器】：末段本来就不该存在（数组追加更是 '-'）
         const parent = diagWalkSegs(stat, segs.slice(0, -1));
         if (!parent.ok || !parent.value || typeof parent.value !== 'object') { r.verdict = 'bad-container'; return r; }
         if (under(segs)) { r.verdict = 'schema-blocked'; return r; }
         const key = segs.length ? segs[segs.length - 1] : '';
+        if (schemaOn) {
+            // MVU 查的是【schema 的 properties】而不是数据里有没有这个键 —— 逐字照抄 case 'insert'
+            // 的两道 schema 闸；节点查不到（null）时 MVU 那边同样不做检查，我们也就不表态。
+            const node = diagSchemaNodeAt(schema, segs.slice(0, -1));
+            if (node && node.type === 'object' && node.extensible === false
+                && !Object.prototype.hasOwnProperty.call(node.properties || {}, key)) { r.verdict = 'not-extensible'; return r; }
+            if (node && node.type === 'array' && node.extensible !== true) { r.verdict = 'not-extensible'; return r; }
+        }
         r.verdict = Object.prototype.hasOwnProperty.call(parent.value, key) ? 'ok' : 'creates';
         return r;
     }
@@ -16052,7 +16253,9 @@ function diagPreflightOp(op, stat) {
     if (op.op === 'remove') { if (under(segs)) r.verdict = 'schema-blocked'; return r; }
     if (op.op === 'delta') {
         if (typeof op.value !== 'number' || !Number.isFinite(op.value)) { r.verdict = 'bad-delta'; return r; }
-        if (under(segs)) r.verdict = 'schema-blocked';
+        if (under(segs)) { r.verdict = 'schema-blocked'; return r; }
+        // 1.77.3：现值不是数字 / 日期 → MVU 报 addUnsupportedValue 跳过（我们从前只查 op 自己的增量）
+        if (schemaOn && !diagDeltaTargetOk(cur.value)) r.verdict = 'delta-target-not-number';
         return r;
     }
     // replace（= MVU 的 set）
@@ -16073,7 +16276,8 @@ function diagPreflightOp(op, stat) {
 // { code, fatal, poison:[下标], total, ops:[{index,op,path,verdict}] }。
 // code：ok / no-block / tag-space / parse-uncertain / not-array / poison。
 // fatal = MVU 连一条指令都不会执行（整块被丢）。'parse-uncertain' 【有意】不 fatal（见 ②）。可单测。
-function diagPreflightPatch(patchBlock, stat) {
+// schema（可选，1.77.3）原样转交 diagPreflightOp —— 缺席时逐字节等于 1.77.2。
+function diagPreflightPatch(patchBlock, stat, schema) {
     const text = String(patchBlock == null ? '' : patchBlock);
     const out = { code: 'no-block', fatal: false, poison: [], total: 0, ops: [] };
     const got = diagPatchOpsOf(text);
@@ -16088,7 +16292,7 @@ function diagPreflightPatch(patchBlock, stat) {
             out.poison.push(i);
             return { index: i, op: (o && o.op) || null, path: (o && o.path) || '', verdict: 'poison' };
         }
-        const v = diagPreflightOp(o, stat);
+        const v = diagPreflightOp(o, stat, schema);
         v.index = i;
         return v;
     });
@@ -16330,6 +16534,29 @@ function diagDoubleBlockNotice(n) {
         + '下一步：请重新诊断。';
 }
 
+// 纯函数：residual（每条 op 按我们的规则都该落地、却一个字都没写）那一段的收尾建议。1.77.3 拆成两版：
+// 挂了 mvu_zod 的卡（指纹 = MvuData.schema 被设成字符串 '没有用别管这个'）走 zod 版，其余走原生版。
+// 两版共用同一条【真正可照做】的下一步：MVU 的错误通知默认是关的（酒馆助手 → MVU 变量框架面板 → 通知），
+// 打开之后 MVU / mvu_zod 自己的 toast 会写明是哪条指令、为什么被拒 —— 我们猜不出来的那部分它知道。
+// ⚠ 1.77.2 之前这里写「mvu_zod【整批一起】拒绝」——2026-09-06 逐行核过 mvu_zod 源码，它自 2026-02-07
+//   起是【逐条】apply + safeParse、成功的合并进去，所以那句是错话，不许再写回来。
+// 【文案待 Prince 否决权】可单测。
+function diagResidualAdvice(schema) {
+    if (schema === '没有用别管这个') {
+        return '这张卡挂了变量结构校验脚本（mvu_zod）：它逐条检查每一个写入，不合规的那条会被悄悄丢掉，'
+            + '其余照常。要看真正原因：打开酒馆助手的 MVU 变量框架面板 → 通知 → 勾上「变量初始化/更新出错时通知」，'
+            + '再跑一次，弹出的 [MVU zod] 提示会写明是哪条指令、为什么被拒。'
+            + '常见原因：① 值超出卡片规定的范围或选项；② 往卡片没定义的位置新增字段（会被静默剥掉）；'
+            + '③ 存档里已经有一个不合规的值 —— 那样之后每一条更新都会被拒，包括正文模型自己的，'
+            + '得先在🎛 变量编辑器里把那个值改回合规。';
+    }
+    return '这些指令按我们的检查是合法的（动词、路径、取值都对得上），但 MVU 一条都没执行。'
+        + '要看真正原因：打开酒馆助手的 MVU 变量框架面板 → 通知 → 勾上「变量初始化/更新出错时通知」，'
+        + '再跑一次，弹出的 [MVU] 提示会写明是哪条指令、为什么被拒（F12 控制台也有）。'
+        + '常见原因：① 往卡片没标成可扩展的对象/列表里新增项（MVU 默认不允许）；② 给文字字段做加减；'
+        + '③ 酒馆助手 / MVU 版本太旧。';
+}
+
 // 纯函数：【零变化】语境专用的逐条诊断。与 diagReportLines 的区别是这里【有证据】——
 // diagCmpKey(新) === diagCmpKey(旧)，一个字都没写；所以每一条都必须说死「未生效」，再给分类原因
 // 与一个照做得了的下一步。「可能已生效」那句诚实只在【部分生效】语境成立，这里出现就是撒谎。
@@ -16340,8 +16567,8 @@ function diagDoubleBlockNotice(n) {
 //   empty       本来就没有 op（调用方去说「模型认为无需改动」）
 //   nodata      判不出（_.set 方言 / 解析不动）→ 退回 diagReportLines 的零变化版
 // 【文案待 Prince 定】可单测。
-function diagZeroChangeReport(patchText, stat, report, repair) {
-    const pre = diagPreflightPatch(patchText, stat);
+function diagZeroChangeReport(patchText, stat, report, repair, schema) {
+    const pre = diagPreflightPatch(patchText, stat, schema);
     const dropped = (repair && repair.dropped) | 0;
     const blockLine = {
         'poison': `补丁里有 ${pre.poison.length} 条格式不合规的条目 —— MVU 会把整块指令一起丢掉，所以一条都没执行。下一步：请再点一次「诊断」重新生成补丁。`,
@@ -16382,20 +16609,21 @@ function diagZeroChangeReport(patchText, stat, report, repair) {
         // 修复层通常已把它拆成 insert+remove；能走到这一行，说明连拆的证据都不够（源路径查不到之类）。
         'move-unsupported': ['这条写的是「搬家」（move），酒馆助手的变量更新引擎不认这个动作，直接跳过了',
             '重新诊断一次，让它拆成「新建 + 删除」两条'],
+        // 1.77.3：两条 schema 感知的判定（只在拿得到 MvuData.schema 的原生卡上出现）。
+        'not-extensible': ['这一层是卡片没标成可扩展的对象 / 列表，MVU 不允许往里新增项',
+            '改用 replace 写已有字段；真要新增，得在卡片的 $meta 里把这一层标成 extensible'],
+        'delta-target-not-number': ['这一项现在的值不是数字也不是日期，delta 做不了加减',
+            '改用 replace 直接写最终值'],
     };
     const bad = pre.ops.filter((o) => why[o.verdict]);
     const lines = bad.slice(0, 5).map((o) =>
         `「${o.path}」：未生效 —— ${why[o.verdict][0].replace('%OP%', String(o.op))}。下一步：${why[o.verdict][1]}。`);
     const residual = pre.ops.length - bad.length;
     if (residual) {
-        // Deliverable A ③：这些 op 按 MVU 自己的规则本该落地，却一个字都没写 —— 死胡同到此为止，
-        // 把两条真实可查的路指出来（环境 / schema），别再让用户对着「可能已生效」发呆。
-        lines.push('这些指令按 MVU 的规则本身是成立的（动词、路径、取值都对得上），可卡片侧一条也没执行。'
-            + '常见原因有两种：① 酒馆助手（MagVarUpdate 变量更新）版本偏旧或没正常工作；'
-            + '② 这张卡开了 schema 校验（mvu_zod），【类型不符】的写入会被静默拒绝 —— 而且是【整批一起】'
-            + '拒绝，所以哪怕只有一条的类型不对，同一批的其它改动也会跟着一起作废。'
-            + '下一步：先看看平时正常聊天时这张卡的变量会不会自己变 —— 不会变就去更新酒馆助手；'
-            + '会变就对着状态栏核一下这几项该是数字还是文字。');
+        // Deliverable A ③：这些 op 按 MVU 自己的规则本该落地，却一个字都没写 —— 死胡同到此为止。
+        // 1.77.3：文案整段搬进 diagResidualAdvice（原生 / mvu_zod 两版），指的路从「猜环境」换成
+        // 「打开 MVU 自己的错误通知」—— 那条 toast 里写着我们猜不出来的那一半。
+        lines.push(diagResidualAdvice(schema));
     }
     return { code: residual ? 'residual' : 'classified', text: lines.length ? '\n' + lines.join('\n') : '' };
 }
@@ -28687,7 +28915,94 @@ async function onFetchModels() {
     }
 }
 
+/* ------------------------------------------------------------------ *
+ * 柚月记忆（yuzuki-Memory）兼容垫（1.77.1）
+ * ------------------------------------------------------------------ */
+// 它的 config/request-probe.js 包了 window.fetch：凡 URL 含 /v1/chat/completions 或
+// /api/backends/chat-completions/generate（神谕直连 / 后端转发 / 配置文件三条路全中）、又不是酒馆自己
+// 前台生成发出的请求，一律先过 sanitizeMemoryFromBody → removeExistingMemoryInjections：正文含下面五个
+// 记忆标题之一的消息被【整条删掉】（它把那当成自己上次注入的残留）。神谕把整段上下文装在一条 system
+// 里——故事记录里只要有一条 AI 回复抄过它注入的「【当前世界状态参考 - 角色档案】」标题，整条提示词
+// 就没了，端点只收到用户那一句（卡比兽 2026-09-06 报「诊断不修」：截图里模型把「状态栏错误」当手机
+// 故障来答，正是没有 system 的形态；scratchpad 拿它真源码复现 = 发 2 条收 1 条）。
+// 垫法：只在柚月在场时，给出站【副本】里这五个子串的「【」后各插一个零宽空格（U+200B）——它的判据是
+// text.includes(标题)，拆开就不认；模型读到的字面不变、存档 / 主聊天 / 世界书一字不动；柚月不在场时
+// 原引用原样返回（出站字节全同）。标题表抄自 yuzuki-Memory 0.9.2 config/prompt-ready-injector.js
+// MEMORY_INJECTION_MARKERS（commit 2e4a23d7），yzm-shield.test.mjs 钉。它升级改了表就得跟着改。
+const YZM_MEMORY_MARKERS = ['【前情提要 -', '【前情提要】', '【当前世界状态参考 -', '【记忆只读数据库 -', '【剧情摘要】'];
+const YZM_SHIELD_CHAR = '\u200B';
+
+function yzmMemoryPresent() {
+    try { return !!(window.YuzukiMemory && window.YuzukiMemory.loaded); } catch (e) { return false; }
+}
+
+// 纯函数：把文本里每个记忆标题从「【」后拆开；没有标题时原字符串返回。幂等（拆开的标题不再命中）。
+function yzmShieldText(text) {
+    let out = String(text);
+    for (const m of YZM_MEMORY_MARKERS) {
+        if (out.includes(m)) out = out.split(m).join('【' + YZM_SHIELD_CHAR + m.slice(1));
+    }
+    return out;
+}
+
+// 运行时绊线：它把自己的删除器导出成 YuzukiMemory.PromptReadyInjector.sanitizeMemoryFromChat（0.9.2 起）。窄垫完后
+// 拿【副本】过一遍它——还会被删 = 它改了标题表（我们钉的是 0.9.2 那五条）→ 那一条改用兜底 yzmShieldTextWide（每个
+// 「【」后都插 U+200B：它的标题一律以「【」开头），并 console.warn 一次提醒更新 YZM_MEMORY_MARKERS；兜底后仍会被删 →
+// 第二种 warn（判据已不是「【」开头的子串）。导出缺失 / 不是函数 / 抛错 → 当没有绊线（回到钉死的表）。只喂副本：它会
+// 就地 splice 数组、改写 content（stripMemoryVars）。柚月不在场时 yzmShieldMessages 起手就返回，这里根本不会被调到。
+function yzmWouldDelete(m) {
+    try {
+        const yz = window.YuzukiMemory;
+        const fn = yz && yz.PromptReadyInjector && yz.PromptReadyInjector.sanitizeMemoryFromChat;
+        if (typeof fn !== 'function') return false;
+        const probe = [{ ...m }];
+        const out = fn(probe);
+        return (Array.isArray(out) ? out : probe).length === 0;
+    } catch (e) { return false; }
+}
+
+// 兜底：每个还没拆开的「【」后插 U+200B。幂等（已拆开的不再插）。
+function yzmShieldTextWide(text) {
+    return String(text).replace(new RegExp('【(?!' + YZM_SHIELD_CHAR + ')', 'g'), '【' + YZM_SHIELD_CHAR);
+}
+
+const yzmTripwireWarned = { list: false, hard: false };   // 每种各提醒一次，别刷屏
+function yzmTripwireWarn(kind) {
+    if (yzmTripwireWarned[kind]) return;
+    yzmTripwireWarned[kind] = true;
+    console.warn(kind === 'list'
+        ? '[Story Oracle] 柚月记忆的清理函数仍会删掉已垫过的消息——它的记忆标题表大概改了（神谕钉的是 0.9.2 那五条）；本条已改用兜底（每个「【」后插零宽空格）。请更新 YZM_MEMORY_MARKERS。'
+        : '[Story Oracle] 柚月记忆的清理函数连兜底后的消息也会删——它的判据已不是「【」开头的子串匹配；兼容垫已失效，请对着它的新源码重做。');
+}
+
+// 消息数组：柚月不在场 / 没有一条含标题 → 原数组原引用；否则新数组、只复制被改的那几条（原对象不动）。
+function yzmShieldMessages(messages) {
+    if (!Array.isArray(messages) || !yzmMemoryPresent()) return messages;
+    let changed = false;
+    const out = messages.map((m) => {
+        if (!m || typeof m.content !== 'string') return m;
+        let c = yzmShieldText(m.content);
+        if (yzmWouldDelete({ ...m, content: c })) {   // 绊线：它的删除器仍认得 → 兜底
+            c = yzmShieldTextWide(c);
+            yzmTripwireWarn('list');
+            if (yzmWouldDelete({ ...m, content: c })) yzmTripwireWarn('hard');
+        }
+        if (c === m.content) return m;
+        changed = true;
+        return { ...m, content: c };
+    });
+    return changed ? out : messages;
+}
+
+// 请求体：messages 没变就原 body 原引用。
+function yzmShieldBody(body) {
+    if (!body || !Array.isArray(body.messages)) return body;
+    const messages = yzmShieldMessages(body.messages);
+    return messages === body.messages ? body : { ...body, messages };
+}
+
 async function callDirect(url, apiKey, body, signal) {
+    body = yzmShieldBody(body);   // 柚月记忆兼容垫（1.77.1）：在分流到后端转发之前垫，两条路共用
     if (getSettings().directViaBackend) return callBackendForward(url, apiKey, body, signal); // 经酒馆后端转发（避免 CORS）
     const extra = resolveExtraParams(getSettings()); // 附加参数（1.70.0）：坏文本在此抛错、绝不静默
     const res = await fetch(url, {
@@ -28718,6 +29033,7 @@ function extractNonStreamContent(raw) {
 }
 
 async function streamDirect(url, apiKey, body, signal, onDelta) {
+    body = yzmShieldBody(body);   // 柚月记忆兼容垫（1.77.1）
     if (getSettings().directViaBackend) return streamBackendForward(url, apiKey, body, signal, onDelta); // 经酒馆后端转发（避免 CORS）
     const extra = resolveExtraParams(getSettings()); // 附加参数（1.70.0）：坏文本在此抛错、绝不静默
     const res = await fetch(url, {
@@ -28768,6 +29084,7 @@ async function streamDirect(url, apiKey, body, signal, onDelta) {
 // 经 onLive({content, reasoning}) 实时报给查看器——这样窗口在 reasoning 模型上也看得到「在动」，而不是盯着
 // content 卡在空。返回值仍是 content 全文（供 parseArcBeat / parseArcCheck 解析，与非流式完全一致）。
 async function streamDirectArc(url, apiKey, body, signal, onLive) {
+    body = yzmShieldBody(body);   // 柚月记忆兼容垫（1.77.1）
     if (getSettings().directViaBackend) return streamBackendForwardArc(url, apiKey, body, signal, onLive); // 经酒馆后端转发（避免 CORS）
     const extra = resolveExtraParams(getSettings()); // 附加参数（1.70.0）：坏文本在此抛错、绝不静默
     const res = await fetch(url, { method: 'POST', headers: applyExtraHeaders(directHeaders(apiKey), extra), body: JSON.stringify({ ...applyExtraBody(body, extra), stream: true }), signal });
@@ -28812,6 +29129,7 @@ async function streamDirectArc(url, apiKey, body, signal, onLive) {
 }
 
 async function callProfile(profileId, messages, maxTokens, overridePayload, signal) {
+    messages = yzmShieldMessages(messages);   // 柚月记忆兼容垫（1.77.1）：配置文件路也经它包过的 fetch
     const ctx = getCtx();
     // 附加参数（1.70.0）：经 overridePayload 透传三键——仅「自定义（兼容 OpenAI）」源的配置档会被
     // ST 后端读取（其余源忽略，弹窗警示行有言在先）。排在展开序前面 = 调用点显式 override 恒赢。
@@ -28827,6 +29145,7 @@ async function callProfile(profileId, messages, maxTokens, overridePayload, sign
 }
 
 async function callProfileStream(profileId, messages, maxTokens, overridePayload, signal, onText) {
+    messages = yzmShieldMessages(messages);   // 柚月记忆兼容垫（1.77.1）
     const ctx = getCtx();
     const extra = resolveExtraParams(getSettings()); // 附加参数（1.70.0）：仅 custom 源配置档生效，同 callProfile
     // With stream:true, sendRequest resolves to a function that creates an
