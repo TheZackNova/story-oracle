@@ -1634,6 +1634,14 @@ const ENABLE_FIX_CUSTOM_TASK = true;
 // （renderChatReplyHtml / addActionControls）+ repaintHtmlForRoom / repaintControlPlan（main 房重挂）。
 const ENABLE_ACTION_OPTIONS = true;
 
+// 🧭 参谋区块不上屏（1.79.0）：<StoryPlan> / <StorySequence> 此前原样印进 <pre class="so-plan-raw">，
+// 于是同一份内容在屏幕上出现两次——一遍是机器读的原文，一遍是它下面那张排好版的采纳卡。卡片本就
+// 【完全透明】（单拍卡印 title/goal/why/seed 四个键的全部，序列卡逐拍列全），所以藏掉原文不丢任何信息。
+// 【只藏解析出卡片的那一块】：没解析出来的（缺 goal 之类）照旧原样印出来——既没有卡又没有字 = 模型
+// 写的东西凭空消失，那是比刷屏更坏的失败。屏幕上还留着原文的地方，正是模型把格式写坏了的地方。
+// false ⇒ 回到 1.78.0 逐字行为（全部区块进 <pre>）。读点：renderAdvisorReplyHtml（定稿 + F5 补渲同一处）。
+const HIDE_ADVISOR_BLOCK_TEXT = true;
+
 // 自动诊断总开关（用户功能请求；实验性——它是唯一会【自动写入 MVU 游戏状态】的功能，故配真正的杀死开关）。
 // === 出问题时的一键回退：把这一行改成 false ===（无需动其它代码）。关掉时：
 //   · 诊断按钮退回原始两态（关 ↔ 诊断，AUTO 不可达）；· 后台 message_received 监听器空转、绝不调用模型、
@@ -25201,12 +25209,27 @@ function renderMarkdownOnly(text) {
     }
     return null;
 }
+// 「正文进去、空白出来」只报一次（1.79.0）：这条会在【每一条回复】上复发，逐条刷屏反而把真正
+// 有用的那一行淹掉。一次会话报一次，够定位了。
+let soWarnedRegexBlank = false;
+
 function renderReplyHtml(text) {
     const ctx = getCtx();
+    const src = String(text || '');
     try {
         if (typeof ctx.messageFormatting === 'function') {
-            const html = ctx.messageFormatting(String(text || ''), ctx.name2 || '故事神谕', false, false, null);
+            const html = ctx.messageFormatting(src, ctx.name2 || '故事神谕', false, false, null);
             if (typeof html === 'string' && html) return html;
+            // 1.79.0：进去有字、出来空白——这不是「没什么可渲染的」，是【被吃掉了】。此前这条路
+            // 一声不吭地返回 null，害得整条链路只剩「界面莫名其妙不渲染」这一个症状可查（实测：
+            // 一条 minDepth 的主聊天显示正则 `/.*​/s → 空` 无差别命中了神谕的正文）。
+            if (src.trim() && !soWarnedRegexBlank) {
+                soWarnedRegexBlank = true;
+                console.warn('[Story Oracle] Bộ định dạng của SillyTavern trả về chuỗi rỗng cho một đoạn văn bản có nội dung '
+                    + '—— nhiều khả năng một script regex hiển thị (Extensions → Regex) đã xoá sạch nó. '
+                    + 'Bảng Oracle sẽ lùi về hiển thị Markdown cho lượt này. Đoạn bị xoá bắt đầu bằng: '
+                    + JSON.stringify(src.slice(0, 60)));
+            }
         }
     } catch (e) {
         console.warn('[Story Oracle] messageFormatting failed; showing raw text.', e);
@@ -25245,12 +25268,24 @@ function splitStoryPlanSegments(text) {
 // 不该被显示正则/挂件加工），<StoryPlan> 块进 <pre class="so-plan-raw"> 转义原样（采纳卡在气泡下方照旧，
 // 由 parseStoryPlans 从【字符串】解析，与这里的 DOM 渲染无关）。库缺失（无 showdown/DOMPurify）→ 返回 null，
 // 调用方回退纯文本；纯散文回复与普通聊天关正则时同路输出。
+// 1.79.0：区块【解析成卡了就不上屏】。判据是「这一块自己能不能解析出卡」，而不是「这条回复里
+// 有没有卡」——一条回复里三块好、一块坏时，只有坏的那块留在屏幕上，正好指出模型写坏了哪一块。
+// 判据与挂卡端（parseStoryPlans / parseStorySequences 读的是同一份 cleanText 字符串）同源，所以
+// 「屏幕上没了」与「下面出了卡」永远同进同退，不会出现藏了却没卡的空档。
+function advisorBlockBecameCard(blockText) {
+    if (!HIDE_ADVISOR_BLOCK_TEXT) return false;
+    if (parseStoryPlans(blockText).length) return true;
+    return ENABLE_PLAN_SEQ && parseStorySequences(blockText).length > 0;
+}
+
 function renderAdvisorReplyHtml(text) {
     const segs = splitStoryPlanSegments(text);
     if (!segs.some((g) => g.type === 'plan')) return renderMarkdownOnly(String(text || ''));
     let html = '';
+    let hidAny = false;
     for (const g of segs) {
         if (g.type === 'plan') {
+            if (advisorBlockBecameCard(g.text)) { hidAny = true; continue; }
             html += '<pre class="so-plan-raw">' + escapeHtml(g.text) + '</pre>';
         } else if (g.text.trim()) {
             const h = renderMarkdownOnly(g.text);
@@ -25258,6 +25293,8 @@ function renderAdvisorReplyHtml(text) {
             html += h;
         }
     }
+    // 整条回复只有区块、一句散文都没写：空气泡比多一行说明更难读，补一行 UI 文案（非模型产出）。
+    if (!html && hidAny) return '<p class="so-hint">Mấy phương án cho lượt này:</p>';
     return html;
 }
 
@@ -25282,6 +25319,29 @@ function renderChatReplyHtml(text, render) {
     }
     // 模型只甩了一个区块、一句散文都没写：空气泡比多一行说明更难读，补一行 UI 文案（非模型产出）。
     return html || '<p class="so-hint">Vài lựa chọn hành động cho lượt này:</p>';
+}
+
+/* ------------------------------------------------------------------ *
+ * 普通聊天定稿渲染的两级回退（1.79.0）。
+ *
+ * 缘起（Prince 的安装，2026-09-09 实测）：主聊天的一条显示正则 `[LSR] Gói tin nhắn người dùng`
+ * ——find `/.*​/s`、replace 空、placement 含 AI_OUTPUT、勾了「Alter Chat Display」、minDepth 10
+ * ——把神谕的正文整段吃空。它在主聊天无害（那边 depth 恒为数字，只吃第 10 楼往上的显示），但神谕
+ * 的正文不是主聊天楼层：ST 的 messageFormatting 由 messageId 反推 depth，神谕给不出合法楼号，
+ * getRegexedString 那句 `if (typeof depth === 'number')` 于是整个跳过深度闸，`/.*​/s` 无差别命中。
+ * 结果 messageFormatting 返回 ''，renderReplyHtml 把空串判为失败返回 null，定稿路径回落【裸文本】
+ * ——连本该被卡片取代的 <ActionOptions> 区块也一起印了出来。
+ *
+ * 这一层的契约：正则渲染器交白卷时【绝不】回落到裸文本，改退一步用 renderMarkdownOnly（它不碰
+ * 正则引擎，任何贪婪正则都吃不到它）。代价是这一条回复没有状态栏 / HTML 挂件，只有 Markdown——
+ * 但区块该藏的还是藏着，用户看到的是一条正常回复而不是一堆标签。两个渲染器都交白卷（缺 showdown /
+ * DOMPurify）才返回 null，由调用方维持纯文本，与 1.17.18 起的回退契约一致。
+ * 【按整条回复决策，不按段】：一条回复里半段走 ST 格式器、半段走 Markdown 会拼出前后不一致的排版。
+ * ------------------------------------------------------------------ */
+function renderPlainChatHtml(text, viaRegex, viaMarkdown) {
+    const html = renderChatReplyHtml(text, viaRegex);
+    if (html != null) return html;
+    return renderChatReplyHtml(text, viaMarkdown);
 }
 
 function buildMessages() {
@@ -25957,7 +26017,9 @@ async function generateReply() {
             if (isPlainChat) {
                 // 🎲 行动建议（1.78.0）：<ActionOptions> 区块【不上屏】——它的内容已经变成气泡下方那排卡；
                 // 没有区块时这一层是恒等变换，走的还是原来那两个渲染器。
-                const html = renderChatReplyHtml(cleanText, s.applyRegex ? renderReplyHtml : renderMarkdownOnly);
+                // 1.79.0：外面再包一层回退——ST 的显示正则把正文吃空时退 Markdown，不再回落裸文本
+                //（那正是区块重新露脸的原因，见 renderPlainChatHtml 的注释）。
+                const html = renderPlainChatHtml(cleanText, s.applyRegex ? renderReplyHtml : renderMarkdownOnly, renderMarkdownOnly);
                 if (html != null) {
                     contentEl.innerHTML = html;
                     contentEl.classList.add('so-rendered');
