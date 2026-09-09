@@ -45,6 +45,26 @@ const DEFAULT_SYSTEM_PROMPT =
 - 除非用户要求展开细节，否则请简明、直接地回答。
 - 如果某些内容在所提供的上下文中并不存在，请如实说明，不要凭空编造。`;
 
+// 🎲 行动建议教学段（1.78.0）：只在普通聊天里追加，作为独立的一段——绝不写进 s.systemPrompt，
+// 用户自定义的系统提示词与它互不覆盖。option 的字要能【原样粘进主聊天输入框】，所以跟随故事语言
+//（同 <StoryPlan> 的 goal）；note 是给用户看的旁注，用越南语。
+// 「什么时候不出」写得比「什么时候出」还细：这是个由模型自己判断意图的功能，误触发的代价（每条
+// 回复尾巴挂一排卡）比漏触发大得多。
+const ACTION_OPTIONS_SECTION =
+`【行动建议区块（仅在用户开口要时才出）】
+当用户问的是「我这轮该输入什么」——例如「我该做什么」「给我几个行动选项」「接下来我说什么好」「帮我想几句话发过去」——在回复末尾补一个 <ActionOptions> 区块，列出 3~5 条【${'{{user}}'} 本人可以直接发给主聊天的话或动作】。格式如下，每条 option 一行、可选一行 note：
+
+<ActionOptions>
+option: 用户可以原样粘进输入框的那句话（第一人称、以 ${'{{user}}'} 的身份写、写完整一句，不要写成「你可以试着……」这种建议口吻）
+note: 这么做大概会把剧情带向哪里（一句，可省略；只显示给用户看，不会被粘进输入框）
+option: ……
+</ActionOptions>
+
+- option 的文字使用【主聊天故事所用的语言】（它要被原样发进故事里）；note 用${SO_OUTPUT_LANGUAGE}。
+- 每条 option 之间要真的不一样——不同的态度、不同的方向，别是同一句话换几个词。
+- 区块之外照常用${SO_OUTPUT_LANGUAGE}正常回答；区块只是补充，不要在正文里把这几条又抄一遍。
+- 【绝不要出这个区块】的场合：用户在问剧情、问角色动机、问数值、闲聊、要分析，或者只是让你解释什么东西——哪怕你觉得他接下来可能用得上。拿不准就不出。`;
+
 const DIAGNOSE_SYSTEM_PROMPT =
 `你是一个用于 SillyTavern 角色扮演的 MVU 变量修复助手。玩家的状态由 MVU 框架追踪，它会应用故事模型每一回合发出的更新指令。有时这些更新是错误的，而你的工作就是修正它们。
 
@@ -1605,6 +1625,15 @@ const ENABLE_INJECT_GLUE = true;
 // （与校正互斥；「沿用校正的正文识别」可关）。false ⇒ 下拉无第三档、自定义键惰性、出站字节与 1.76.0 全同。
 const ENABLE_FIX_CUSTOM_TASK = true;
 
+// 🎲 行动建议（1.78.0）：普通聊天里用户问「这轮该输入什么」时，模型用 <ActionOptions> 区块列出几条
+// 可直接粘进主聊天输入框的行动；面板把区块换成一排可点的卡，点一下就把那句话【追加】进 #send_textarea
+// （从不覆盖、从不代发）。这是「解析区块 → 动作卡」模式的第四例（前三例：诊断 / 世界书 / <StoryPlan>），
+// 刻意与参谋的方案卡分家：参谋卡采纳的是【引导目标】（注入主聊天的暗线），这里给的是【用户自己要说的话】。
+// false ⇒ 教学段不进提示词、解析器不被调用、区块原样当普通文字显示，出站字节与 1.77.3 全同。
+// 读点：buildSystemPrompt（默认路径教学段）+ buildPresetMessages（预设路径教学段）+ 定稿渲染
+// （renderChatReplyHtml / addActionControls）+ repaintHtmlForRoom / repaintControlPlan（main 房重挂）。
+const ENABLE_ACTION_OPTIONS = true;
+
 // 自动诊断总开关（用户功能请求；实验性——它是唯一会【自动写入 MVU 游戏状态】的功能，故配真正的杀死开关）。
 // === 出问题时的一键回退：把这一行改成 false ===（无需动其它代码）。关掉时：
 //   · 诊断按钮退回原始两态（关 ↔ 诊断，AUTO 不可达）；· 后台 message_received 监听器空转、绝不调用模型、
@@ -2137,6 +2166,9 @@ const defaults = {
     // 更新提醒（ENABLE_UPDATE_CHECK）：开窗时自动检查新版本（opt-out；开关关则整组不渲染、恒不检查）。
     updAutoCheck: true,
     applyRegex: true,          // run ST's prompt-altering regex (thinking strip, summaries, etc.)
+    // 🎲 行动建议（1.78.0）：普通聊天里问「这轮该输入什么」时出可点的行动卡。关掉 = 教学段不进
+    // 提示词（模型自然就不会出区块）；已经躺在历史里的旧区块仍能重挂卡片，不会让老记录突然变哑。
+    actionOptions: true,
     // 自动诊断（用户功能请求）：开启后，每收到一条新的主聊天 AI 回复，就在后台跑一次诊断
     // 并自动应用修复（见 maybePostReply 编排 → runAutoDiagnose）。autoDiagnoseWarned 记录「不再
     // 提示」那次警告。delayMs 给 MVU 先处理完该回复的更新、再读取权威状态的缓冲时间。
@@ -17845,6 +17877,7 @@ function buildWindow() {
                     ${ENABLE_LWB_BRIDGE ? '<label class="so-check"><input id="so-lwb" type="checkbox"><span>Kèm bản tóm tắt cốt truyện của “LittleWhiteBox”, để Oracle nhớ được cả đoạn truyện cũ —— cần đã cài LittleWhiteBox và bật chức năng “tóm tắt cốt truyện” của nó.</span></label>' : ''}
                     <label class="so-check"><input id="so-hidden" type="checkbox"><span>Đọc cả tin nhắn ẩn (bị /hide) —— mặc định tắt; bật lên thì Oracle đọc hội thoại sẽ thấy cả tin nhắn ẩn (không ảnh hưởng việc quét từ khoá sách thế giới và nhịp arc)</span></label>
                     <label class="so-check"><input id="so-regex" type="checkbox"><span>Áp dụng regex cốt truyện (bóc chuỗi suy luận / thanh trạng thái, dùng bản tóm tắt) —— giữ nhất quán với chat chính</span></label>
+                    ${ENABLE_ACTION_OPTIONS ? '<label class="so-check"><input id="so-act-opts" type="checkbox"><span>🎲 Gợi ý hành động —— hỏi “tôi nên nhập gì bây giờ” thì trả về mấy thẻ bấm được, bấm là nối câu đó vào ô nhập của chat chính (không tự gửi)</span></label>' : ''}
 
                     <label class="so-row"><span>Sách thế giới / kho tri thức</span>
                         <select id="so-wi">
@@ -19135,6 +19168,7 @@ function bindControls() {
         bindFix('#so-fixc-minchars', 'fixAutoMinChars', (v) => clampFixAutoMinChars(v));
     }
     bind('#so-regex', 'applyRegex');
+    if (ENABLE_ACTION_OPTIONS) bind('#so-act-opts', 'actionOptions');   // 🎲 行动建议（行仅在开关开时渲染）
     bind('#so-wi', 'worldInfoMode');
     if (ENABLE_WI_EJS_RENDER) bind('#so-wi-ejs', 'wiRenderEjs');   // 世界书 EJS 渲染（行仅在开关开时渲染）
     bind('#so-sendtemp', 'sendTemperature');
@@ -19273,6 +19307,7 @@ function loadSettingsIntoForm() {
     if (fixSelRowBox) fixSelRowBox.checked = getSettings().fixSelRowButton !== false;
     win.querySelector('#so-tools-header-toggle').checked = !!s.toolsInHeader;
     win.querySelector('#so-regex').checked = !!s.applyRegex;
+    if (ENABLE_ACTION_OPTIONS) { const soAct = win.querySelector('#so-act-opts'); if (soAct) soAct.checked = !!s.actionOptions; }   // 🎲 行动建议（回填勾选态）
     win.querySelector('#so-wi').value = s.worldInfoMode;
     if (ENABLE_WI_EJS_RENDER) { const soWiEjs = win.querySelector('#so-wi-ejs'); if (soWiEjs) soWiEjs.checked = !!s.wiRenderEjs; }   // 世界书 EJS 渲染（回填勾选态）
     win.querySelector('#so-sendtemp').checked = !!s.sendTemperature;
@@ -24123,6 +24158,11 @@ function buildSystemPrompt() {
 
     const parts = [resolveSystemPrompt(s)];
 
+    // 🎲 行动建议（1.78.0）：独立成段，【不】并进 resolveSystemPrompt——那一段用户可以整段改写／清空，
+    // 教学段混进去就会被顺手删掉，而且用户自定义提示词与它本就是两件事。关掉开关 = 这一段不出现，
+    // 模型自然不再产出区块（不需要另一道运行时闸）。
+    if (ENABLE_ACTION_OPTIONS && s.actionOptions) parts.push(ACTION_OPTIONS_SECTION);
+
     const personaBlock = buildPersonaBlock(s.personaId, null, s);
     if (personaBlock) parts.push(personaBlock);
 
@@ -25093,7 +25133,7 @@ function stripReasoningTags(text) {
     for (const tag of REASONING_TAGS) {
         // 已知结构化区块的开标签白名单——pass 0 和 pass 2 都要用，提到循环体顶部（放在 pass 0
         // 之前，否则先引用后声明会抛 ReferenceError/TDZ）。这些区块绝不能被当思维链删掉。
-        const BLOCK_OPENERS = '(?:CharDraft|CharBrief|DraftPatch|StoryPlan|FixedReply|LorebookEdit|UpdateVariable)';
+        const BLOCK_OPENERS = '(?:CharDraft|CharBrief|DraftPatch|StoryPlan|StorySequence|ActionOptions|FixedReply|LorebookEdit|UpdateVariable)';
         // 0) 闭标签出现在任何开标签之前：预设把 <think> 预填进 assistant 消息（开标签在提示词里、
         //    补全里只剩闭标签），或推理模型省略开标签、只回「思考内容</think>正文」——从开头到
         //    闭标签整段都是思维链，连内容一起删。护栏：闭标签之前若已开了已知结构区块（<StoryPlan>
@@ -25221,6 +25261,29 @@ function renderAdvisorReplyHtml(text) {
     return html;
 }
 
+// 🎲 普通聊天的显示渲染（1.78.0）：与参谋 / 工坊的分段渲染同构，但对区块的处置【相反】——
+// 参谋把 <StoryPlan> 原样印进 <pre>（那是要给用户读的方案文本），这里的 <ActionOptions> 是
+// 机器读的原料，印出来只是噪音，所以整段丢掉、只留散文，行动本身由下方的卡片承载。
+// render 参数就是原来那两个渲染器之一（applyRegex 决定），它返回 null（缺 showdown/DOMPurify）
+// 时整条回退纯文本 —— 与 1.17.18 起的回退契约一致。
+// 无区块 ⇒ 直接 render(text)，与 1.77.3 逐字同路（含 ENABLE_ACTION_OPTIONS 关闭时）。
+function renderChatReplyHtml(text, render) {
+    const t = String(text || '');
+    if (!ENABLE_ACTION_OPTIONS) return render(t);
+    const segs = splitActionOptionSegments(t);
+    if (!segs.some((g) => g.type === 'actions')) return render(t);
+    let html = '';
+    for (const g of segs) {
+        if (g.type === 'actions') continue;
+        if (!g.text.trim()) continue;
+        const h = render(g.text);
+        if (h == null) return null;   // 库缺失 → 整条回退纯文本（不出半渲染的杂拼）
+        html += h;
+    }
+    // 模型只甩了一个区块、一句散文都没写：空气泡比多一行说明更难读，补一行 UI 文案（非模型产出）。
+    return html || '<p class="so-hint">Vài lựa chọn hành động cho lượt này:</p>';
+}
+
 function buildMessages() {
     const s = getSettings();
     if (lorebookMode && s.lorebookUsePreset && presetCurationActive(s)) {
@@ -25340,6 +25403,11 @@ function buildPresetMessages(s) {
     // （Prince Opus 实况；本地电池 5/5 复现，终位单尾锚也压不住）。身份头立在预设块之前，把
     // 预设降为风格/语境参考；与故事轮后的尾锚构成与默认路径同款的「顶部身份 + 边界尾锚」夹心。
     if (ENABLE_OFFSTAGE_GUARD) pushMsg(out, 'system', OFFSTAGE_PRESET_HEADERS.normal);
+
+    // 🎲 行动建议（1.78.0）：预设路径同样要有——预设组装整个替换了神谕自己的系统提示，不在这里补
+    // 一发，挂预设的用户就永远拿不到行动卡。位置同 personaBlock（身份头之后、预设块之前）：它是
+    // 输出格式契约，不该被预设的写手人设盖过去。
+    if (ENABLE_ACTION_OPTIONS && s.actionOptions) pushMsg(out, 'system', subst(ctx, ACTION_OPTIONS_SECTION));
 
     // Optional voice-persona layer, off by default in preset mode. When chosen,
     // it leads as a top-level voice directive; the preset still governs content.
@@ -25887,7 +25955,9 @@ async function generateReply() {
             let historyText = cleanText;
             if (useOutputRegex) historyText = applyOutputRegex(cleanText, /*forPrompt*/ true);
             if (isPlainChat) {
-                const html = s.applyRegex ? renderReplyHtml(cleanText) : renderMarkdownOnly(cleanText);
+                // 🎲 行动建议（1.78.0）：<ActionOptions> 区块【不上屏】——它的内容已经变成气泡下方那排卡；
+                // 没有区块时这一层是恒等变换，走的还是原来那两个渲染器。
+                const html = renderChatReplyHtml(cleanText, s.applyRegex ? renderReplyHtml : renderMarkdownOnly);
                 if (html != null) {
                     contentEl.innerHTML = html;
                     contentEl.classList.add('so-rendered');
@@ -26017,6 +26087,11 @@ async function generateReply() {
                     modeEntryNote(`Không nhận được khối <CharDraft> trong lượt trả lời này (${cls.draftError}) —— phần nội dung vẫn nằm nguyên ở trên.`
                         + 'Bạn có thể bảo nó “gửi lại bản vừa rồi, phần đầu ghi kèm target”, hoặc bấm thẳng “🔨 Tạo” trên thẻ thường trú để quy trình rèn ra bản thảo.');
                 }
+            } else if (isPlainChat && ENABLE_ACTION_OPTIONS) {
+                // 🎲 行动建议：只看解析产物，不看设置开关——s.actionOptions 关掉的是【教学段】（模型
+                // 从此不再出区块），已经躺在历史里的旧区块照样出卡，不让老记录突然变哑。
+                const opts = parseActionOptions(cleanText);
+                if (opts.length) addActionControls(assistantEl, opts);
             }
         }
     } catch (err) {
@@ -30059,6 +30134,69 @@ function parseStoryPlans(text) {
     return out;
 }
 
+/* ------------------------------------------------------------------ *
+ * 🎲 行动建议（1.78.0）：<ActionOptions> 的解析 / 分段 / 拼接三件套，全是纯函数 → 可单测。
+ *
+ * 与 parseStoryPlans 同族的容错：标签变体 <action_options>/<Action-Options>、中英越三套键名、
+ * 全角冒号、截断尾块救援。不同点在于【行序有意义】：option 行开一条，其后的 note 行属于它，
+ * 所以按行走而不是像单拍卡那样整块正则取键（那套取的是「块里第一个 goal」，多条会互相盖掉）。
+ * 这一点与 parseStorySequences 的 beat 段同构。
+ * ------------------------------------------------------------------ */
+function parseActionOptions(text) {
+    const out = [];
+    const re = /<Action[_-]?Options>([\s\S]*?)<\/Action[_-]?Options>|<Action[_-]?Options>([\s\S]*)$/gi;
+    let m;
+    while ((m = re.exec(String(text || ''))) !== null) {
+        const inner = m[1] !== undefined ? m[1] : (m[2] || '');
+        const kv = (line, keys) => {
+            for (const k of keys) {
+                const mm = line.match(new RegExp('^\\s*' + k + '\\s*[:：]\\s*(.+)$', 'i'));
+                if (mm && mm[1].trim()) return mm[1].trim();
+            }
+            return null;
+        };
+        let cur = null;
+        for (const line of inner.split('\n')) {
+            const opt = kv(line, ['option', 'hành động', '选项', '行动']);
+            if (opt !== null) { cur = { text: opt, note: '' }; out.push(cur); continue; }
+            // note 只认第一条：模型偶发把旁注拆成两行，后一行盖掉前一行等于静默丢字。
+            const note = kv(line, ['note', 'ghi chú', '理由', '说明']);
+            if (note !== null && cur && !cur.note) cur.note = note;
+        }
+    }
+    return out;
+}
+
+// PURE：把普通聊天回复按 <ActionOptions> 块切成有序段表，配对规则与 parseActionOptions【完全一致】
+// （含截断尾块救援——渲染侧漏了这条 = 半截区块被 Markdown 搅碎，而卡片却出得来）。
+// 平铺不变量：segments.map(g=>g.text).join('') === 原文。孤儿 </ActionOptions> 留在散文里。
+function splitActionOptionSegments(text) {
+    const t = String(text || '');
+    if (!t) return [];
+    const out = [];
+    const re = /<Action[_-]?Options>[\s\S]*?<\/Action[_-]?Options>|<Action[_-]?Options>[\s\S]*$/gi;
+    let last = 0;
+    let m;
+    while ((m = re.exec(t)) !== null) {
+        if (m.index > last) out.push({ type: 'prose', text: t.slice(last, m.index) });
+        out.push({ type: 'actions', text: m[0] });
+        last = m.index + m[0].length;
+    }
+    if (last < t.length) out.push({ type: 'prose', text: t.slice(last) });
+    return out;
+}
+
+// PURE：点卡片时输入框该变成什么（Prince 2026-09-09 定案：只追加、永不覆盖）。
+// 空框 / 只有空白 → 就是这句话；已有字 → 去掉尾部空白后换一行接上（行动是独立的一句，
+// 不该和上一句黏成一行）。加的字本身也去两头空白；加空字符串 = 原样不动。
+function appendActionText(current, addition) {
+    const add = String(addition == null ? '' : addition).trim();
+    const cur = String(current == null ? '' : current);
+    if (!add) return cur;
+    const head = cur.replace(/\s+$/, '');
+    return head ? head + '\n' + add : add;
+}
+
 // <StorySequence> 卡（1.72.0 序列引导）：title 头 + 若干 beat 段（beat: 行开拍）。
 // 与 parseStoryPlans 同族：中英键名 / 全角冒号容错、截断尾块救援。无 goal 的拍丢弃、
 // 零有效拍的序列丢弃。ENABLE_PLAN_SEQ 关时调用点不来（解析器本身保持纯函数）。
@@ -30111,6 +30249,68 @@ function addBriefControls(assistantEl, brief) {
     btn.addEventListener('click', () => runForge());
     bar.appendChild(btn);
     assistantEl.querySelector('.so-bubble').appendChild(bar);
+}
+
+/* ------------------------------------------------------------------ *
+ * 🎲 行动建议卡（1.78.0）：点一下把那句话【追加】进主聊天输入框。
+ *
+ * 与参谋采纳卡的分工：那边写的是暗中注入的引导目标，用户看不到自己发了什么；这边把话原样交到
+ * 输入框里，发不发、改不改都还在用户手上——所以【绝不代按发送】，也【绝不覆盖】已经打了一半的字。
+ * 输入框不在（换皮 / 早期加载 / 未来 ST 改 id）时如实说一声，绝不静默失败。
+ * ------------------------------------------------------------------ */
+function insertActionIntoMainInput(text) {
+    const ta = document.querySelector('#send_textarea');
+    if (!ta) {
+        addSystemNote('Không tìm thấy ô nhập của chat chính (#send_textarea) —— hãy tự sao chép câu này rồi dán vào.');
+        return false;
+    }
+    const next = appendActionText(ta.value, text);
+    if (next === ta.value) return false;
+    ta.value = next;
+    // ST 靠 input 事件做自动撑高 + 存草稿；直接改 .value 不会触发，必须自己补一发（冒泡，jQuery 才收得到）。
+    try { ta.dispatchEvent(new Event('input', { bubbles: true })); } catch (e) { /* ignore */ }
+    try {
+        ta.focus();
+        ta.selectionStart = ta.selectionEnd = ta.value.length;
+        ta.scrollTop = ta.scrollHeight;
+    } catch (e) { /* 非 textarea / 被禁用：字已经进去了，光标位置不是硬需求 */ }
+    return true;
+}
+
+function addActionControls(assistantEl, options) {
+    const bubble = assistantEl.querySelector('.so-bubble');
+    if (!bubble) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'so-act-cards';
+
+    for (const o of options) {
+        const card = document.createElement('button');
+        card.type = 'button';
+        card.className = 'so-act-card';
+        card.title = 'Chèn câu này vào ô nhập của chat chính (nối thêm, không đè, không tự gửi)';
+
+        const line = document.createElement('span');
+        line.className = 'so-act-text';
+        line.textContent = o.text;
+        card.appendChild(line);
+
+        if (o.note) {
+            const note = document.createElement('span');
+            note.className = 'so-act-note';
+            note.textContent = o.note;
+            card.appendChild(note);
+        }
+
+        card.addEventListener('click', () => {
+            // 已插过的卡仍然可以再点（用户可能想连着发两条）——高亮只是「你点过这张」的记号。
+            if (insertActionIntoMainInput(o.text)) card.classList.add('so-act-used');
+        });
+
+        wrap.appendChild(card);
+    }
+
+    bubble.appendChild(wrap);
+    scrollToBottom();
 }
 
 function addPlanControls(assistantEl, plans) {
@@ -30416,7 +30616,11 @@ function repaintHtmlForRoom(streamKey, content) {
     if (streamKey && String(streamKey).startsWith('bld_')) return renderBuilderReplyHtml(t);
     if (streamKey === 'diagnose' || streamKey === 'lorebook') return null;
     if (streamKey === 'fix') return renderReplyHtml(t);
-    return renderMarkdownOnly(t);   // main / 注册插件模式房：1.20.0 F5 补渲行为不变
+    // main / 注册插件模式房：1.20.0 F5 补渲行为不变（照旧只走 Markdown，不看 applyRegex）。
+    // 1.78.0 起【只有 main 房】多一层 <ActionOptions> 剥离——漏了这一处 = F5 后区块原文突然印在
+    // 气泡里。插件模式房不剥：那边定稿时也不剥，两端必须同形，否则 F5 前后看到的不是一回事。
+    if (streamKey === 'main') return renderChatReplyHtml(t, renderMarkdownOnly);
+    return renderMarkdownOnly(t);
 }
 // PURE：按房间算重画后该重挂哪些动作卡。参谋采纳卡 / 世界书应用控件从【字符串】可完整导出 →
 // 全记录重挂（采用 = 元数据 + 注入、应用 = 现读整本书，各自带守卫）；诊断补丁 / 校正应用只挂
@@ -30452,6 +30656,14 @@ function repaintControlPlan(streamKey, list) {
     } else if (streamKey === 'fix') {
         const latest = [...arr].reverse().find(isReply);
         if (latest) out.push({ id: latest.id, kind: 'fixApply' });
+    } else if (streamKey === 'main' && ENABLE_ACTION_OPTIONS) {
+        // 🎲 行动建议：全记录重挂（同参谋采纳卡）——插入的是【用户自己的话】，没有任何会随时间失效
+        // 的状态，翻回三天前那条建议照点不误。
+        for (const m of arr) {
+            if (!isReply(m)) continue;
+            const opts = parseActionOptions(m.content);
+            if (opts.length) out.push({ id: m.id, kind: 'actions', options: opts });
+        }
     }
     return out;
 }
@@ -30502,6 +30714,7 @@ function loadConvoForChat() {
         const m = convo.find((x) => x.id === p.id);
         if (!m || !m._el) continue;
         if (p.kind === 'plans') addPlanControls(m._el, p.plans);
+        else if (p.kind === 'actions') addActionControls(m._el, p.options);
         else if (p.kind === 'seqs') addSeqControls(m._el, p.seqs);
         else if (p.kind === 'lorebook') addLorebookApplyControls(m._el, p.parsed, m);
         else if (p.kind === 'diagPatch') addApplyControls(m._el, p.block, m);

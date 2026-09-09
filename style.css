@@ -2862,3 +2862,44 @@ body.so-skin-light .so-cur-disabled {
     color: var(--SmartThemeBodyColor, #e6e6e6);
 }
 .so-z2-block .so-apply-btn:hover:not(:disabled) { background: rgba(var(--so-ink), 0.14); filter: none; }
+
+/* ---- 🎲 行动建议卡（1.78.0）：普通聊天里「这轮该输入什么」的可点选项。
+   骑 .so-plan-cards 的分栏骨架（同一条虚线分隔 + 纵向 gap），但卡片本身是 <button>：
+   整张卡就是热区，点一下把那句话追加进主聊天输入框。着色用 --so-accent（普通聊天的主色）
+   而不是参谋的 --so-adv-accent —— 两族卡长得像但做的事完全不同，颜色是唯一的即时区分。 ---- */
+.so-act-cards {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px dashed var(--SmartThemeBorderColor, rgba(255, 255, 255, 0.16));
+}
+.so-act-card {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    width: 100%;
+    padding: 8px 11px;
+    border-radius: 10px;
+    border: 1px solid color-mix(in srgb, var(--so-accent) 38%, transparent);
+    background: color-mix(in srgb, var(--so-accent) 8%, transparent);
+    color: var(--SmartThemeBodyColor);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.12s ease, border-color 0.12s ease, transform 0.06s ease;
+}
+.so-act-card:hover {
+    background: color-mix(in srgb, var(--so-accent) 16%, transparent);
+    border-color: color-mix(in srgb, var(--so-accent) 62%, transparent);
+}
+.so-act-card:active { transform: translateY(1px); }
+.so-act-card:focus-visible { outline: 2px solid var(--so-accent); outline-offset: -2px; }
+/* 点过的卡：压暗 + 左侧实心边，读作「你点过这张」。仍然可以再点（用户可能想连发两条）。 */
+.so-act-card.so-act-used {
+    opacity: 0.62;
+    border-left: 3px solid var(--so-accent);
+}
+.so-act-text { font-size: 0.86em; line-height: 1.5; overflow-wrap: anywhere; }
+.so-act-note { font-size: 0.78em; line-height: 1.45; opacity: 0.7; overflow-wrap: anywhere; }

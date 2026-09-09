@@ -5,7 +5,7 @@ Phần hỏi đáp nằm trong **cửa sổ riêng, lịch sử riêng** —— 
 
 **Nó giúp bạn sáu việc** (đổi bằng các biểu tượng ở trên cùng, loại trừ lẫn nhau):
 
-- 💬 **Trò chuyện thường** —— hỏi về cốt truyện: "vì sao cô ấy làm vậy", "hiện thiện cảm bao nhiêu rồi".
+- 💬 **Trò chuyện thường** —— hỏi về cốt truyện: "vì sao cô ấy làm vậy", "hiện thiện cảm bao nhiêu rồi"; hỏi "tôi nên nhập hành động nào" thì nhận **thẻ gợi ý bấm một cái là chèn vào ô nhập**.
 - 🩺 **Chẩn đoán** —— sửa biến trạng thái MVU (khi số liệu / thanh trạng thái lệch nhau).
 - 📖 **Sách thế giới** —— bàn về sách thế giới, hoặc để nó **sửa thẳng** sách thế giới giúp bạn.
 - 🧭 **Cố vấn cốt truyện** —— cùng nghĩ hướng đi cho cốt truyện và **dẫn ngầm** chat chính (gồm cả "cung truyện" nhiều nhịp và "chuỗi nhịp" viết sẵn).
@@ -216,6 +216,8 @@ Bật lên rồi thì cố vấn cốt truyện sẽ chủ động nói "tôi vi
 ## 💬 Trò chuyện thường
 
 Chế độ mặc định, cứ hỏi về cốt truyện. Prompt hệ thống được dựng lại ở mỗi lần gửi, nên thứ Oracle nhìn thấy luôn là trạng thái truyện mới nhất.
+
+**🎲 Gợi ý hành động (từ 1.78.0, mặc định bật).** Hỏi thẳng "tôi nên nhập hành động nào bây giờ", "cho tôi vài lựa chọn đi" là Oracle trả về **mấy thẻ bấm được** nằm ngay dưới bong bóng, mỗi thẻ một câu bạn có thể gửi vào truyện (kèm một dòng ghi chú câu đó sẽ đưa cốt truyện đi đâu). Bấm vào thẻ thì câu đó được **nối thêm** vào ô nhập của chat chính —— không đè lên chữ bạn đang gõ dở, và **không tự gửi**: sửa lại rồi bấm gửi vẫn hoàn toàn trong tay bạn. Bấm nhiều thẻ thì các câu xếp chồng theo dòng. Chỉ hỏi cốt truyện, hỏi số liệu hay tán gẫu thì thẻ không hiện. Muốn tắt hẳn thì bỏ tick "🎲 Gợi ý hành động" trong phần cài đặt.
 
 ## 🩺 Chế độ chẩn đoán (Diagnose)
 
